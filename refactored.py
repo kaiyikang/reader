@@ -524,7 +524,7 @@ def main():
     book_repo = EbookLibAdapter()
     translator = OpenRouterTranslatorAdapter(api_key)
     cache_manager = LocalFileCacheAdapter(epub_path)
-    token_estimator = TiktokenAdapter() # 👈 新增实例化
+    token_estimator = TiktokenAdapter()
 
     # 3. 注入到用例层 (UseCase)
     use_case = TranslateEpubUseCase(book_repo, translator, cache_manager, token_estimator)

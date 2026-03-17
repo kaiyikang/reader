@@ -337,3 +337,228 @@ Text to translate:
    - 翻译过程中断可重新运行从断点继续
    - 全部成功后缓存自动清理，术语表保留
    - 更换目标语言时需手动删除旧缓存文件
+
+## new Refactoring version 1
+
+作为一个专业的架构师，我非常赞同你引入 **Clean Architecture (整洁架构)** 或 **Hexagonal Architecture (六边形架构 / 端口与适配器)** 的想法。
+
+你目前的脚本虽然功能完整，但存在典型的“面条代码”特征：业务逻辑（如何判断哪些HTML标签需要翻译）、基础设施（请求OpenRouter API、读写文件）和表现层（CLI交互）严重耦合在一起。这会导致代码难以编写单元测试，且一旦需要更换大模型API或更换EPUB解析库，改动成本极大。
+
+按照你的要求，我将为你设计一个**单文件中的类组织结构骨架**，剥离具体的实现细节，仅展示架构的层级、类的职责以及依赖注入（Dependency Injection）的关系。
+
+### 重构核心思想：依赖倒置原则 (DIP)
+* **Domain (领域层)**：包含核心数据模型和接口定义（Ports）。不依赖任何第三方库（如 `requests`, `ebooklib`, `bs4`）。
+* **UseCase (应用层)**：编排业务流程。只依赖领域层定义的接口，不关心具体实现。
+* **Infrastructure (基础设施层)**：实现领域层的接口（Adapters）。这里才是真正调用外部API、读写文件、解析HTML的地方。
+
+### 架构骨架设计 (Python 代码结构)
+
+```python
+import abc
+from dataclasses import dataclass
+from pathlib import Path
+from typing import List, Dict, Optional, Tuple
+
+# ============================================================================
+# 1. DOMAIN LAYER (领域层)
+# ============================================================================
+# 包含：核心实体 (Entities)、值对象 (Value Objects) 和 抽象接口 (Ports)
+# 规则：这一层绝不允许导入 requests, ebooklib, bs4 等第三方具体实现库。
+
+@dataclass
+class TranslationConfig:
+    """值对象：翻译配置"""
+    target_lang: str
+    mode: str # 'translation_only' | 'bilingual'
+
+@dataclass
+class Term:
+    """实体：术语"""
+    original: str
+    translation: str
+
+@dataclass
+class ChapterInfo:
+    """实体：章节信息摘要"""
+    id: str
+    title: str
+    is_completed: bool = False
+
+# --- 端口 (Ports) / 抽象接口 ---
+
+class ITranslationProvider(abc.ABC):
+    """防腐层接口：LLM 翻译服务提供者"""
+    @abc.abstractmethod
+    def translate_blocks(self, texts: List[str], target_lang: str, terms: List[Term]) -> Tuple[List[str], List[Term]]:
+        """输入原文列表，返回译文列表和提取出的新术语"""
+        pass
+
+class IBookRepository(abc.ABC):
+    """接口：电子书仓储 (负责读、写、解析)"""
+    @abc.abstractmethod
+    def load_book(self, file_path: Path) -> None: pass
+    
+    @abc.abstractmethod
+    def get_chapter_list(self) -> List[ChapterInfo]: pass
+    
+    @abc.abstractmethod
+    def extract_translatable_blocks(self, chapter_id: str) -> List[str]: pass
+    
+    @abc.abstractmethod
+    def apply_translation(self, chapter_id: str, original_blocks: List[str], translated_blocks: List[str], mode: str) -> None: pass
+    
+    @abc.abstractmethod
+    def save_book(self, output_path: Path) -> None: pass
+
+class ICacheManager(abc.ABC):
+    """接口：缓存与持久化管理器"""
+    @abc.abstractmethod
+    def load_progress(self, book_id: str) -> Dict: pass
+    
+    @abc.abstractmethod
+    def save_progress(self, book_id: str, completed_chapters: List[str], chapter_contents: Dict) -> None: pass
+    
+    @abc.abstractmethod
+    def load_terms(self, book_id: str) -> List[Term]: pass
+    
+    @abc.abstractmethod
+    def save_terms(self, book_id: str, terms: List[Term]) -> None: pass
+
+
+# ============================================================================
+# 2. USE CASE LAYER (应用/用例层)
+# ============================================================================
+# 包含：具体的业务流程编排。
+# 规则：只依赖 Domain 层，通过依赖注入接收 Infra 层的实例。
+
+class TranslateEpubUseCase:
+    """用例：执行整本 EPUB 翻译的核心流程"""
+    
+    def __init__(self, 
+                 book_repo: IBookRepository, 
+                 translator: ITranslationProvider, 
+                 cache_manager: ICacheManager):
+        # 依赖注入 (Dependency Injection)
+        self.book_repo = book_repo
+        self.translator = translator
+        self.cache_manager = cache_manager
+
+    def execute(self, epub_path: Path, config: TranslationConfig) -> Path:
+        """
+        核心业务编排逻辑 (伪代码描述步骤)：
+        1. book_repo.load_book(epub_path)
+        2. cache_manager.load_progress() 检查断点
+        3. cache_manager.load_terms() 加载历史术语
+        4. 遍历 book_repo.get_chapter_list():
+            a. 跳过已完成的章节
+            b. book_repo.extract_translatable_blocks() 获取待翻译文本
+            c. 如果没有文本，跳过
+            d. translator.translate_blocks() 调用大模型翻译
+            e. 合并新老术语，去重
+            f. book_repo.apply_translation() 将译文写回章节
+            g. cache_manager.save_progress() & save_terms() 实时保存
+        5. book_repo.save_book(output_path)
+        6. 返回新书路径
+        """
+        pass
+
+
+# ============================================================================
+# 3. INFRASTRUCTURE LAYER (基础设施层)
+# ============================================================================
+# 包含：对 Domain 层接口的具体实现 (Adapters)。
+# 规则：这里可以尽情使用 requests, ebooklib, bs4, json 等库。
+
+class OpenRouterTranslatorAdapter(ITranslationProvider):
+    """具体实现：调用 OpenRouter (Gemini) 的 API，包含 Prompt 组装、网络重试、JSON 解析提取等脏活累活"""
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+        
+    def translate_blocks(self, texts: List[str], target_lang: str, terms: List[Term]) -> Tuple[List[str], List[Term]]:
+        # 你的 extract_json_from_text, call_openrouter_api 等细节逻辑全部封装在这里
+        pass
+
+class EbookLibAdapter(IBookRepository):
+    """具体实现：使用 ebooklib 和 bs4 解析和修改 EPUB"""
+    def __init__(self):
+        self.book = None
+        
+    def load_book(self, file_path: Path) -> None:
+        # epub.read_epub
+        pass
+        
+    def extract_translatable_blocks(self, chapter_id: str) -> List[str]:
+        # BeautifulSoup 解析 HTML，过滤 p, h1, div 等标签的逻辑放在这里
+        pass
+        
+    def apply_translation(self, chapter_id: str, original_blocks: List[str], translated_blocks: List[str], mode: str) -> None:
+        # BeautifulSoup 组装 DOM，实现双语/单语替换的逻辑放在这里
+        pass
+
+class LocalFileCacheAdapter(ICacheManager):
+    """具体实现：读写本地 .cache.json 和 _terms.json"""
+    def __init__(self, base_dir: Path):
+        self.base_dir = base_dir
+        
+    # JSON 的读写、版本号校验等具体逻辑
+    pass
+
+class CLIDisplay:
+    """具体实现：表现层，负责与用户交互 (CLI)"""
+    @staticmethod
+    def get_user_inputs() -> TranslationConfig:
+        # argparse 和 input() 的逻辑
+        pass
+        
+    @staticmethod
+    def show_progress(current: int, total: int, chapter_title: str):
+        # 终端打印进度条
+        pass
+
+
+# ============================================================================
+# 4. MAIN / COMPOSITION ROOT (组装根)
+# ============================================================================
+# 程序的入口，负责将所有的 Infra 实现实例化，并注入到 UseCase 中。
+
+def main():
+    # 1. 初始化配置与表现层 (UI)
+    config = CLIDisplay.get_user_inputs()
+    epub_path = Path("...") # 从 CLI 参数获取
+    api_key = "..." # 从环境变量获取
+    
+    # 2. 实例化基础设施 (Adapters)
+    book_repo = EbookLibAdapter()
+    translator = OpenRouterTranslatorAdapter(api_key)
+    cache_manager = LocalFileCacheAdapter(epub_path.parent)
+    
+    # 3. 依赖注入到 用例层 (UseCase)
+    use_case = TranslateEpubUseCase(
+        book_repo=book_repo,
+        translator=translator,
+        cache_manager=cache_manager
+    )
+    
+    # 4. 执行业务逻辑
+    try:
+        output_file = use_case.execute(epub_path, config)
+        print(f"🎉 翻译完成: {output_file}")
+    except Exception as e:
+        print(f"❌ 发生致命错误: {e}")
+
+if __name__ == "__main__":
+    main()
+```
+
+### 架构师的建议与洞察：
+
+1.  **HTML 处理归属问题（经典难题）**：
+    在你的原始脚本中，`translate_chapter` 既做了业务编排，又做了 HTML 解析。在整洁架构中，HTML 是 EPUB 的**存储细节**。因此，我将它划分到了 `EbookLibAdapter` (基础设施)。
+    * **Domain 层** 只应该看到“待翻译的字符串列表 (`List[str]`)”。
+    * **Adapter** 负责将 HTML DOM 剥离成字符串给 Domain，然后再把 Domain 翻译好的字符串塞回 HTML DOM 里。
+2.  **API 健壮性的隔离**：
+    你的 `extract_json_from_text` 和重试逻辑是非常好的工程实践。但在架构上，它们属于“为了应对网络 API 不稳定而做的补救措施”，并非翻译的核心业务。将它们封装在 `OpenRouterTranslatorAdapter` 的内部，可以保证 `UseCase` 层的代码干净清爽（它只知道调用了 `translate_blocks` 并拿到了结果）。
+3.  **可测试性 (Testability)**：
+    按照现在的结构，如果你想测试你的断点续传逻辑 (`TranslateEpubUseCase`)，你完全不需要真的去读取 EPUB 也不需要消耗 token 调 API。你可以传入一个 `MockBookRepository` 和一个 `MockTranslator`，这在以前的“面条代码”中是做不到的。
+
+接下来，你会希望我进一步展开其中某一个特定类（比如负责 HTML 和 Domain 边界的 `EbookLibAdapter`）的具体内部代码映射吗？

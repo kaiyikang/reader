@@ -10,7 +10,6 @@
 
 #!/usr/bin/env python3
 """
-EPUB 翻译器 (Clean Architecture 重构版)
 运行方式: uv run translator.py <your_book.epub>
 """
 
@@ -28,86 +27,71 @@ from typing import List, Dict, Tuple, Optional
 # ============================================================================
 # 1. DOMAIN LAYER (领域层)
 # ============================================================================
-# 规则：绝对禁止导入外部的具体实现库 (如 requests, ebooklib, bs4)
 
 @dataclass
 class TranslationConfig:
-    """值对象：翻译配置"""
     target_lang: str
-    mode: str  # 'translation_only' | 'bilingual'
+    mode: str
 
 @dataclass
 class Term:
-    """实体：术语"""
     original: str
     translation: str
+    frequency: int = 1
 
 @dataclass
 class ChapterInfo:
-    """实体：章节信息摘要"""
     id: str
     title: str
 
-# --- services ---
-
 def merge_terms(existing: List[Term], new_terms: List[Term]) -> List[Term]:
-    """领域逻辑：去重并合并术语"""
-    existing_originals = {t.original for t in existing}
-    merged = list(existing)
+    """领域逻辑：合并术语并累加出现频次"""
+    term_map = {t.original: t for t in existing}
+    
     for t in new_terms:
-        if t.original not in existing_originals:
-            merged.append(t)
-            existing_originals.add(t.original)
-    return merged
+        if t.original in term_map:
+            # 如果术语已存在，说明它是高频核心词，权重 +1
+            term_map[t.original].frequency += 1
+        else:
+            # 新术语，直接加入字典
+            term_map[t.original] = t
+            
+    return list(term_map.values())
 
-# --- 端口 (Ports) / 抽象接口 ---
 
 class ITranslationProvider(abc.ABC):
     @abc.abstractmethod
-    def translate_blocks(self, texts: List[str], target_lang: str, terms: List[Term]) -> Tuple[List[str], List[Term]]:
-        pass
+    def translate_blocks(self, texts: List[str], target_lang: str, terms: List[Term]) -> Tuple[List[str], List[Term]]: pass
 
 class IBookRepository(abc.ABC):
     @abc.abstractmethod
     def load_book(self, file_path: Path) -> None: pass
-    
     @abc.abstractmethod
-    def get_book_info(self) -> Tuple[str, str, int]: pass # 返回 (书名, 作者, 章节数)
-
+    def get_book_info(self) -> Tuple[str, str, int]: pass
     @abc.abstractmethod
     def get_chapter_list(self) -> List[ChapterInfo]: pass
-    
     @abc.abstractmethod
     def extract_translatable_blocks(self, chapter_id: str) -> List[str]: pass
-    
     @abc.abstractmethod
     def apply_translation(self, chapter_id: str, translated_blocks: List[str], mode: str) -> None: pass
-
     @abc.abstractmethod
     def set_chapter_content(self, chapter_id: str, content: str) -> None: pass
-
     @abc.abstractmethod
     def get_chapter_content(self, chapter_id: str) -> str: pass
-    
     @abc.abstractmethod
     def save_book(self, output_path: Path) -> None: pass
 
 class ICacheManager(abc.ABC):
     @abc.abstractmethod
-    def load_progress(self, current_chapter_ids: List[str]) -> Tuple[List[str], Dict[str, str], Optional[str], Optional[str]]: pass
-    
+    def load_progress(self, current_chapter_ids: List[str]) -> Tuple[List[str], Dict[str, str], Optional[str], Optional[str], List[Term]]: pass
     @abc.abstractmethod
-    def save_progress(self, completed_chapters: List[str], chapter_contents: Dict[str, str], target_lang: str, mode: str) -> None: pass
-    
+    def save_progress(self, completed_chapters: List[str], chapter_contents: Dict[str, str], target_lang: str, mode: str, terms: List[Term]) -> None: pass
     @abc.abstractmethod
-    def load_terms(self, target_lang: str) -> List[Term]: pass
-    
+    def load_terms_from_file(self, target_lang: str) -> List[Term]: pass
     @abc.abstractmethod
-    def save_terms(self, target_lang: str, terms: List[Term]) -> None: pass
-
+    def save_terms_to_file(self, target_lang: str, terms: List[Term]) -> None: pass
     @abc.abstractmethod
     def clear_progress(self) -> None: pass
-
 
 class ITokenEstimator(abc.ABC):
     @abc.abstractmethod
@@ -117,11 +101,8 @@ class ITokenEstimator(abc.ABC):
 # ============================================================================
 # 2. USE CASE LAYER (应用/用例层)
 # ============================================================================
-# 规则：只依赖 Domain 层，编排业务流程
 
 class TranslateEpubUseCase:
-    """核心业务：执行整本 EPUB 的翻译"""
-    
     def __init__(self, 
                  book_repo: IBookRepository, 
                  translator: ITranslationProvider, 
@@ -132,27 +113,30 @@ class TranslateEpubUseCase:
         self.cache_manager = cache_manager
         self.token_estimator = token_estimator
 
+    def execute(self, epub_path: Path, cli_display) -> Optional[Path]:
 
-    def execute(self, epub_path: Path, config: TranslationConfig, cli_display) -> Path:
-        self.book_repo.load_book(epub_path)
         chapters = self.book_repo.get_chapter_list()
         chapter_ids = [ch.id for ch in chapters]
 
-        # 1. 加载缓存与术语
-        completed_chapters, chapter_contents, cached_lang, cached_mode = self.cache_manager.load_progress(chapter_ids)
+        # 1. 加载进度、配置与缓存术语
+        completed_chapters, chapter_contents, cached_lang, cached_mode, cache_terms = self.cache_manager.load_progress(chapter_ids)
+        
         if cached_lang and cached_mode:
-            config.target_lang = cached_lang
-            config.mode = cached_mode
+            config = TranslationConfig(target_lang=cached_lang, mode=cached_mode)
             cli_display.show_cache_resume(len(completed_chapters), cached_lang, cached_mode)
+        else:
+            config = cli_display.get_user_inputs()
 
-        global_terms = self.cache_manager.load_terms(config.target_lang)
+        # 2. 从文件加载术语并与缓存术语合并双源去重
+        file_terms = self.cache_manager.load_terms_from_file(config.target_lang)
+        global_terms = merge_terms(cache_terms, file_terms)
         cli_display.show_terms_loaded(len(global_terms))
 
-        # 2. 恢复已完成章节的内容
+        # 3. 恢复已完成章节的内容
         for ch_id, content in chapter_contents.items():
             self.book_repo.set_chapter_content(ch_id, content)
 
-        # 2.1 Token 预估与确认
+        # 4. Token 预估与确认
         pending_texts = []
         for chapter in chapters:
             if chapter.id not in completed_chapters:
@@ -160,9 +144,10 @@ class TranslateEpubUseCase:
                 pending_texts.extend(blocks)
                 
         token_count, cost = self.token_estimator.estimate_cost(pending_texts)
-        cli_display.confirm_translation(token_count, cost)
+        if not cli_display.confirm_translation(token_count, cost):
+            return None # 用户取消翻译
 
-        # 3. 核心翻译循环
+        # 5. 核心翻译循环
         total = len(chapters)
         for i, chapter in enumerate(chapters, 1):
             if chapter.id in completed_chapters:
@@ -173,36 +158,30 @@ class TranslateEpubUseCase:
             start_time = time.time()
 
             try:
-                # 提取
                 blocks = self.book_repo.extract_translatable_blocks(chapter.id)
                 if not blocks:
                     completed_chapters.append(chapter.id)
                     cli_display.show_chapter_empty()
                     continue
 
-                # 翻译
                 translated_blocks, new_terms = self.translator.translate_blocks(blocks, config.target_lang, global_terms)
                 
-                # 合并术语
                 global_terms = merge_terms(global_terms, new_terms)
 
-                # 回写 DOM
                 self.book_repo.apply_translation(chapter.id, translated_blocks, config.mode)
 
-                # 记录状态
                 completed_chapters.append(chapter.id)
                 chapter_contents[chapter.id] = self.book_repo.get_chapter_content(chapter.id)
 
-                # 持久化
-                self.cache_manager.save_progress(completed_chapters, chapter_contents, config.target_lang, config.mode)
-                self.cache_manager.save_terms(config.target_lang, global_terms)
+                self.cache_manager.save_progress(completed_chapters, chapter_contents, config.target_lang, config.mode, global_terms)
+                self.cache_manager.save_terms_to_file(config.target_lang, global_terms)
 
                 cli_display.show_chapter_done(time.time() - start_time)
 
             except Exception as e:
                 cli_display.show_error_and_exit(e, len(completed_chapters), total, len(global_terms))
 
-        # 4. 保存最终文件并清理缓存
+        # 6. 保存最终文件并清理缓存
         lang_suffix = config.target_lang.lower().replace(" ", "_")
         output_path = epub_path.with_name(f"{epub_path.stem}_{lang_suffix}.epub")
         self.book_repo.save_book(output_path)
@@ -214,30 +193,49 @@ class TranslateEpubUseCase:
 # ============================================================================
 # 3. INFRASTRUCTURE LAYER (基础设施层)
 # ============================================================================
-# 规则：实现 Domain 接口，可以任意使用第三方库
 
+import re
 import requests
 import tiktoken
 from bs4 import BeautifulSoup, NavigableString
 from ebooklib import epub
 
 class TiktokenAdapter(ITokenEstimator):
-    """具体实现：使用 tiktoken 估算成本"""
     def estimate_cost(self, texts: List[str]) -> Tuple[int, float]:
         if not texts:
             return 0, 0.0
-        
         encoder = tiktoken.get_encoding("cl100k_base")
         total_text = "".join(texts)
         token_count = len(encoder.encode(total_text))
-        
-        # 按照原脚本的定价逻辑：每百万 token $0.15 (假设输入输出比例约 1:1，乘 2)
         estimated_cost = (token_count * 2 / 1_000_000) * 0.15
         return token_count, estimated_cost
 
-class OpenRouterTranslatorAdapter(ITranslationProvider):
-    def __init__(self, api_key: str):
+class ILLMClient(abc.ABC):
+    @abc.abstractmethod
+    def generate_json(self, prompt: str) -> str: pass
+
+class OpenRouterClient(ILLMClient):
+    def __init__(self, api_key: str, model: str = "google/gemini-3.1-flash-lite-preview"):
         self.api_key = api_key
+        self.model = model
+
+    def generate_json(self, prompt: str) -> str:
+        url = "https://openrouter.ai/api/v1/chat/completions"
+        headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
+        payload = {
+            "model": self.model,
+            "response_format": {"type": "json_object"},
+            "messages": [{"role": "user", "content": prompt}]
+        }
+        resp = requests.post(url, headers=headers, json=payload, timeout=120)
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"]
+
+class LLMTranslatorAdapter(ITranslationProvider):
+    def __init__(self, llm_client: ILLMClient, max_retries: int = 3, batch_size: int = 30):
+        self.llm_client = llm_client
+        self.max_retries = max_retries
+        self.batch_size = batch_size # 💡 新增：每次发送给大模型的最大段落数
         
     def _extract_json_from_text(self, content: str) -> str:
         depth, start = 0, -1
@@ -251,55 +249,85 @@ class OpenRouterTranslatorAdapter(ITranslationProvider):
                     return content[start:i+1]
         raise ValueError("未找到完整的 JSON 对象")
 
-    def translate_blocks(self, texts: List[str], target_lang: str, terms: List[Term]) -> Tuple[List[str], List[Term]]:
-        terms_prompt = ""
-        if terms:
-            terms_prompt = "## Glossary (use these translations consistently)\n"
-            for t in terms:
-                terms_prompt += f"- {t.original} -> {t.translation}\n"
+    def _is_term_in_text(self, term: str, text: str) -> bool:
+        """💡 优化：更智能的术语匹配，防止单词边界假阳性"""
+        # 如果术语完全由纯英文字母/数字/空格/连字符组成，使用单词边界精确匹配
+        if re.match(r'^[a-zA-Z0-9\s\-_]+$', term):
+            return bool(re.search(rf'\b{re.escape(term)}\b', text, re.IGNORECASE))
+        # 否则（如中文术语），直接使用子串匹配
+        return term in text
 
-        prompt = f"""You are a professional {target_lang} native translator specialized in eBook content... (遵守你的翻译规则)
+    def translate_blocks(self, texts: List[str], target_lang: str, terms: List[Term], max_terms: int = 50) -> Tuple[List[str], List[Term]]:
+        all_translated_paragraphs = []
+        all_new_terms = []
+        
+        # 💡 优化：切片批处理，防止单次请求超出大模型最大输出 Token 限制
+        for i in range(0, len(texts), self.batch_size):
+            batch_texts = texts[i:i + self.batch_size]
+            batch_combined_text = " ".join(batch_texts)
+            
+            terms_prompt = ""
+            if terms:
+                # 💡 使用优化后的匹配逻辑
+                active_terms = [t for t in terms if self._is_term_in_text(t.original, batch_combined_text)]
+                active_terms = sorted(active_terms, key=lambda x: x.frequency, reverse=True)[:max_terms]
+
+                if active_terms:
+                    compact_glossary = ", ".join([f"'{t.original}':'{t.translation}'" for t in active_terms])
+                    terms_prompt = f"## Glossary (Strictly follow): {compact_glossary}\n"
+
+            prompt = f"""You are a professional {target_lang} native translator specialized in eBook content. Your task is to fluently translate text into {target_lang}.
+
+## Translation Rules
+1. Output only the translated content, without explanations or additional content
+2. The returned translation must maintain exactly the same number of paragraphs and format as the original text
+3. If the text contains HTML tags, consider where the tags should be placed in the translation while maintaining fluency
+4. For content that should not be translated (such as proper nouns, code, etc.), keep the original text
+5. Maintain the original tone, style, and narrative voice of the eBook
+6. Ensure the translation resonates with the intended audience in the target language
+7. Preserve literary devices, metaphors, and culturally significant elements appropriately
+
 {terms_prompt}
 Return JSON format: {{"paragraphs": ["..."], "terms": [{{"original": "...", "translation": "..."}}]}}
 Text to translate:
-{json.dumps(texts, ensure_ascii=False)}
+{json.dumps(batch_texts, ensure_ascii=False)}
 """
-        url = "https://openrouter.ai/api/v1/chat/completions"
-        headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
-        payload = {
-            "model": "google/gemini-3.1-flash-lite-preview",
-            "response_format": {"type": "json_object"},
-            "messages": [{"role": "user", "content": prompt}]
-        }
+            
+            # 单个 Batch 的重试循环
+            for attempt in range(self.max_retries):
+                try:
+                    content = self.llm_client.generate_json(prompt)
+                    try: 
+                        result = json.loads(content)
+                    except json.JSONDecodeError: 
+                        result = json.loads(self._extract_json_from_text(content))
+                    
+                    paragraphs = result.get("paragraphs", [])
+                    if len(paragraphs) != len(batch_texts):
+                        raise ValueError(f"段落数不匹配: 期望 {len(batch_texts)}, 实际 {len(paragraphs)}")
+                    
+                    new_terms = [Term(**t) for t in result.get("terms", []) if "original" in t and "translation" in t]
+                    
+                    # 成功后汇总结果
+                    all_translated_paragraphs.extend(paragraphs)
+                    all_new_terms.extend(new_terms)
+                    break # 成功跳出重试循环
+                    
+                except Exception as e:
+                    if attempt < self.max_retries - 1:
+                        # 💡 优化：指数退避等待 (2s, 4s, 8s) 缓解 API 限流问题
+                        sleep_time = 2 ** (attempt + 1)
+                        print(f"\n    ⚠️ 批次 {i//self.batch_size + 1} 异常 ({e})，等待 {sleep_time} 秒后重试...")
+                        time.sleep(sleep_time)
+                    else:
+                        raise Exception(f"大模型请求彻底失败: {e}")
 
-        for attempt in range(3):
-            try:
-                resp = requests.post(url, headers=headers, json=payload, timeout=120)
-                resp.raise_for_status()
-                content = resp.json()["choices"][0]["message"]["content"]
-                
-                try: result = json.loads(content)
-                except: result = json.loads(self._extract_json_from_text(content))
-                
-                paragraphs = result.get("paragraphs", [])
-                if len(paragraphs) != len(texts):
-                    raise ValueError(f"段落数不匹配: {len(paragraphs)} vs {len(texts)}")
-                
-                new_terms = [Term(**t) for t in result.get("terms", []) if "original" in t and "translation" in t]
-                return paragraphs, new_terms
-                
-            except Exception as e:
-                if attempt < 2:
-                    print(f"\n    ⚠️ API 异常 ({e})，正在重试...")
-                    time.sleep(2)
-                else:
-                    raise Exception(f"API 请求彻底失败: {e}")
+        return all_translated_paragraphs, all_new_terms
 
 class EbookLibAdapter(IBookRepository):
     def __init__(self):
         self.book = None
         self._chapters: Dict[str, epub.EpubHtml] = {}
-        # 临时保存当前章节的 BS4 对象，避免序列化导致的对象引用丢失
         self._current_soup: Optional[BeautifulSoup] = None
         self._current_tags: List = []
 
@@ -325,7 +353,7 @@ class EbookLibAdapter(IBookRepository):
             return []
             
         self._current_soup = BeautifulSoup(chapter.get_content(), 'html.parser')
-        block_tags = ['p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'div', 'li', 'blockquote', 'td', 'th']
+        block_tags = ['p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'div', 'li', 'blockquote', 'figcaption', 'td', 'th', 'dd', 'dt']
         self._current_tags = []
         
         for tag in self._current_soup.find_all(block_tags):
@@ -353,9 +381,10 @@ class EbookLibAdapter(IBookRepository):
                 block.insert_after(new_block)
                 block.insert_after(NavigableString("\n\n"))
                 
-        # 写回到内存中的 chapter 对象
         self._chapters[chapter_id].set_content(self._current_soup.encode('utf-8', formatter='html'))
-        self._current_soup = None # 清理缓存
+        # 释放缓存防止串台污染
+        self._current_soup = None 
+        self._current_tags = []
 
     def set_chapter_content(self, chapter_id: str, content: str) -> None:
         self._chapters[chapter_id].set_content(content.encode('utf-8'))
@@ -364,7 +393,6 @@ class EbookLibAdapter(IBookRepository):
         return self._chapters[chapter_id].get_content().decode('utf-8')
 
     def _fix_toc_uids(self, items):
-        """修复目录 UID 防止写入报错"""
         for item in items:
             if isinstance(item, epub.Link) and not item.uid:
                 item.uid = f"uid-{hash(item.href) % 10000000:07d}"
@@ -390,31 +418,41 @@ class LocalFileCacheAdapter(ICacheManager):
         lang_suffix = target_lang.lower().replace(" ", "_")
         return self.epub_path.with_name(f"{self.epub_path.stem}_{lang_suffix}_terms.json")
 
-    def load_progress(self, current_chapter_ids: List[str]) -> Tuple[List[str], Dict[str, str], Optional[str], Optional[str]]:
+    def load_progress(self, current_chapter_ids: List[str]) -> Tuple[List[str], Dict[str, str], Optional[str], Optional[str], List[Term]]:
         if not self.cache_path.exists():
-            return [], {}, None, None
+            return [], {}, None, None, []
             
         with open(self.cache_path, 'r', encoding='utf-8') as f:
             cache = json.load(f)
             if cache.get('version') != self.CACHE_VERSION:
-                return [], {}, None, None
+                return [], {}, None, None, []
                 
-        completed = [c for c in cache.get('completed_chapters', []) if c in current_chapter_ids]
-        contents = {k: v for k, v in cache.get('chapter_contents', {}).items() if k in current_chapter_ids}
-        return completed, contents, cache.get('target_lang'), cache.get('mode')
+        completed = cache.get('completed_chapters', [])
+        valid_completed = [c for c in completed if c in current_chapter_ids]
+        
+        # 补回原版的缓存严格校验逻辑
+        invalid_count = len(completed) - len(valid_completed)
+        if invalid_count > 0:
+            print(f"   ⚠️  清理了 {invalid_count} 章无效缓存（章节名与当前文件不匹配）")
 
-    def save_progress(self, completed_chapters: List[str], chapter_contents: Dict[str, str], target_lang: str, mode: str) -> None:
+        contents = {k: v for k, v in cache.get('chapter_contents', {}).items() if k in current_chapter_ids}
+        terms = [Term(**t) for t in cache.get('terms', []) if isinstance(t, dict)]
+        
+        return valid_completed, contents, cache.get('target_lang'), cache.get('mode'), terms
+
+    def save_progress(self, completed_chapters: List[str], chapter_contents: Dict[str, str], target_lang: str, mode: str, terms: List[Term]) -> None:
         data = {
             'version': self.CACHE_VERSION,
             'completed_chapters': completed_chapters,
             'chapter_contents': chapter_contents,
             'target_lang': target_lang,
-            'mode': mode
+            'mode': mode,
+            'terms': [asdict(t) for t in terms]
         }
         with open(self.cache_path, 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
 
-    def load_terms(self, target_lang: str) -> List[Term]:
+    def load_terms_from_file(self, target_lang: str) -> List[Term]:
         terms_path = self._get_terms_path(target_lang)
         if terms_path.exists():
             with open(terms_path, 'r', encoding='utf-8') as f:
@@ -422,7 +460,7 @@ class LocalFileCacheAdapter(ICacheManager):
                 return [Term(**t) for t in data if isinstance(t, dict)]
         return []
 
-    def save_terms(self, target_lang: str, terms: List[Term]) -> None:
+    def save_terms_to_file(self, target_lang: str, terms: List[Term]) -> None:
         terms_path = self._get_terms_path(target_lang)
         with open(terms_path, 'w', encoding='utf-8') as f:
             json.dump([asdict(t) for t in terms], f, ensure_ascii=False, indent=2)
@@ -432,7 +470,6 @@ class LocalFileCacheAdapter(ICacheManager):
             self.cache_path.unlink()
 
 class CLIDisplay:
-    """表现层：负责与用户的终端交互"""
     @staticmethod
     def check_env() -> str:
         api_key = os.getenv("OPENROUTER_API_KEY")
@@ -454,11 +491,30 @@ class CLIDisplay:
 
     @staticmethod
     def get_user_inputs() -> TranslationConfig:
-        print("请选择目标语言: 1.Chinese 2.English 3.Japanese ... (输入具体语言如 Chinese):")
-        lang = input("👉 目标语言: ").strip() or "Chinese"
-        print("请选择输出模式: 1.单语 2.双语对照")
-        mode = "translation_only" if input("👉 输入 (1/2): ").strip() == "1" else "bilingual"
-        return TranslationConfig(target_lang=lang, mode=mode)
+        languages = {
+            "1": "Chinese", "2": "English", "3": "Japanese", "4": "Korean",
+            "5": "French", "6": "German", "7": "Spanish", "8": "Russian"
+        }
+        print("请选择目标语言：")
+        for k, v in languages.items():
+            print(f"  {k}. {v}")
+        lang_choice = input("👉 输入数字 (1-8): ").strip()
+        if lang_choice not in languages:
+            print("❌ 无效的选择。")
+            sys.exit(1)
+
+        print("\n请选择输出模式：")
+        print("  1. 仅译文")
+        print("  2. 原文 + 译文（双语对照）")
+        mode_choice = input("👉 输入数字 (1-2): ").strip()
+        if mode_choice not in ["1", "2"]:
+            print("❌ 无效的选择。")
+            sys.exit(1)
+
+        return TranslationConfig(
+            target_lang=languages[lang_choice],
+            mode="translation_only" if mode_choice == "1" else "bilingual"
+        )
 
     @staticmethod
     def show_book_info(title: str, author: str, chapters: int):
@@ -466,12 +522,13 @@ class CLIDisplay:
 
     @staticmethod
     def show_cache_resume(completed_count: int, lang: str, mode: str):
-        print(f"\n💾 发现兼容版本缓存，将无缝继续！(已完成 {completed_count} 章, {lang}, {mode})")
+        print(f"\n💾 发现兼容版本缓存，将无缝继续！")
+        print(f"   已完成 {completed_count} 章 | 目标语言: {lang} | 模式: {'仅译文' if mode == 'translation_only' else '双语对照'}")
 
     @staticmethod
     def show_terms_loaded(count: int):
         if count > 0:
-            print(f"📔 成功加载历史术语表共 {count} 条")
+            print(f"📔 成功加载术语表共 {count} 条")
 
     @staticmethod
     def show_chapter_start(current: int, total: int, title: str):
@@ -492,13 +549,13 @@ class CLIDisplay:
     @staticmethod
     def show_error_and_exit(e: Exception, completed: int, total: int, term_count: int):
         print(f"\n❌ 失败! 详情: {e}")
-        print(f"已安全保存进度 ({completed}/{total})，重新运行即可无缝继续。")
+        print(f"已安全保存进度 ({completed}/{total}) 术语表共 {term_count} 条，重新运行即可无缝继续。")
         sys.exit(1)
     
     @staticmethod
-    def confirm_translation(token_count: int, estimated_cost: float) -> None:
+    def confirm_translation(token_count: int, estimated_cost: float) -> bool:
         if token_count == 0:
-            return
+            return True
             
         print(f"\n📊 预估信息（待翻译章节）：")
         print(f"   文本 Token 数：约 {token_count:,} tokens")
@@ -507,7 +564,8 @@ class CLIDisplay:
         confirm = input("\n🚀 是否开始翻译？(y/n): ").strip().lower()
         if confirm not in ['y', 'yes']:
             print("已取消翻译。")
-            sys.exit(0)
+            return False
+        return True
 
 
 # ============================================================================
@@ -515,31 +573,26 @@ class CLIDisplay:
 # ============================================================================
 
 def main():
-    # 1. 启动与配置检查
     api_key = CLIDisplay.check_env()
     epub_path = CLIDisplay.get_epub_path()
 
-    sys.exit(1)
-    # 2. 实例化基础设施 (Adapters)
     book_repo = EbookLibAdapter()
-    translator = OpenRouterTranslatorAdapter(api_key)
+    open_router_client = OpenRouterClient(api_key)
+    translator = LLMTranslatorAdapter(open_router_client)
     cache_manager = LocalFileCacheAdapter(epub_path)
     token_estimator = TiktokenAdapter()
 
-    # 3. 注入到用例层 (UseCase)
     use_case = TranslateEpubUseCase(book_repo, translator, cache_manager, token_estimator)
-
-    # 4. 初始化基础交互
+    
     book_repo.load_book(epub_path)
     title, author, chapter_count = book_repo.get_book_info()
     CLIDisplay.show_book_info(title, author, chapter_count)
-    config = CLIDisplay.get_user_inputs()
 
-    # 5. 执行核心业务
-    print("\n🚀 开始翻译...")
-    output_file = use_case.execute(epub_path, config, CLIDisplay)
-    print(f"\n🎉 翻译全部完成！\n📄 新文件: {output_file}")
-
+    print("🚀 准备翻译环境...")
+    output_file = use_case.execute(epub_path, CLIDisplay)
+    
+    if output_file:
+        print(f"\n🎉 翻译全部完成！\n📄 新文件: {output_file}")
 
 if __name__ == "__main__":
     main()
